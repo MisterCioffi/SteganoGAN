@@ -12,6 +12,12 @@ from torch.nn.functional import binary_cross_entropy_with_logits, mse_loss
 from torch.optim import Adam
 from tqdm import tqdm
 
+import sys
+sys.path.append('./DiffJPEG')
+from DiffJPEG import DiffJPEG
+
+
+
 from steganogan.utils import bits_to_bytearray, bytearray_to_text, ssim, text_to_bits
 
 DEFAULT_PATH = os.path.join(
@@ -108,25 +114,40 @@ class SteganoGAN(object):
         return torch.zeros((N, self.data_depth, H, W), device=self.device).random_(0, 2)
 
     def _encode_decode(self, cover, quantize=False):
-        """Encode random data and then decode it.
-
-        Args:
-            cover (image): Image to use as cover.
-            quantize (bool): whether to quantize the generated image or not.
-
-        Returns:
-            generated (image): Image generated with the encoded message.
-            payload (bytes): Random data that has been encoded in the image.
-            decoded (bytes): Data decoded from the generated image.
-        """
+        """Encode random data and then decode it, with simulated JPEG noise."""
         payload = self._random_data(cover)
         generated = self.encoder(cover, payload)
         if quantize:
             generated = (255.0 * (generated + 1.0) / 2.0).long()
             generated = 2.0 * generated.float() / 255.0 - 1.0
 
-        decoded = self.decoder(generated)
+        # --- MODIFICA JPEG ROBUSTO ---
+        # Creiamo un'istanza del frullatore JPEG "al volo".
+        # Le immagini di addestramento (usando il loader standard) sono tipicamente di altezza/larghezza variabile.
+        # DiffJPEG ha bisogno di sapere le dimensioni esatte o lavora direttamente sul tensore.
+        # Usa i canali e le dimensioni correnti dell'immagine 'generated'.
+        _, _, h, w = generated.size()
+        jpeg_layer = DiffJPEG(height=h, width=w, differentiable=True, quality=90).to(self.device)
+        
+        # Facciamo passare l'immagine attraverso il frullatore!
+        # ATTENZIONE: DiffJPEG si aspetta pixel in range [0, 1] o [0, 255].
+        # SteganoGAN usa range [-1, 1]. Dobbiamo fare una conversione avanti e indietro.
+        
+        # 1. Convertiamo in range [0, 1] per DiffJPEG
+        img_for_jpeg = (generated + 1.0) / 2.0 
+        
+        # 2. Applichiamo la compressione JPEG
+        noisy_img_0_1 = jpeg_layer(img_for_jpeg)
+        
+        # 3. Riconvertiamo nel range [-1, 1] di SteganoGAN per il Decoder
+        noisy_generated = (noisy_img_0_1 * 2.0) - 1.0
+        # --- FINE MODIFICA ---
 
+        # Il Decoder ora prova a leggere l'immagine frullata!
+        decoded = self.decoder(noisy_generated)
+
+        # Restituiamo l'immagine "generated" pura per il Critic (che non deve vedere il rumore JPEG)
+        # ma il "decoded" è basato sull'immagine frullata, forzando l'Encoder a corazzare il segnale.
         return generated, payload, decoded
 
     def _critic(self, image):
