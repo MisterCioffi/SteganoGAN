@@ -32,7 +32,7 @@ def main():
 
     # Sostituiamo l'inizializzazione da zero con il caricamento del modello
     print("Caricamento del modello pre-addestrato per il fine-tuning...")
-    steganogan = SteganoGAN.load("dense.steg", cuda=True)
+    steganogan = SteganoGAN.load("dense", cuda=True)
     
     # Reimpostiamo le directory di log per il nuovo addestramento
     steganogan.log_dir = os.path.join('models', timestamp)
