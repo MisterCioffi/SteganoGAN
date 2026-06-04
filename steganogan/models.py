@@ -14,6 +14,9 @@ from tqdm import tqdm
 
 from steganogan.utils import bits_to_bytearray, bytearray_to_text, ssim, text_to_bits
 
+from DiffJPEG import DiffJPEG
+
+
 DEFAULT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     'train')
@@ -108,25 +111,35 @@ class SteganoGAN(object):
         return torch.zeros((N, self.data_depth, H, W), device=self.device).random_(0, 2)
 
     def _encode_decode(self, cover, quantize=False):
-        """Encode random data and then decode it.
-
-        Args:
-            cover (image): Image to use as cover.
-            quantize (bool): whether to quantize the generated image or not.
-
-        Returns:
-            generated (image): Image generated with the encoded message.
-            payload (bytes): Random data that has been encoded in the image.
-            decoded (bytes): Data decoded from the generated image.
-        """
+        """Encode random data and then decode it with JPEG compression."""
         payload = self._random_data(cover)
         generated = self.encoder(cover, payload)
+        
         if quantize:
             generated = (255.0 * (generated + 1.0) / 2.0).long()
             generated = 2.0 * generated.float() / 255.0 - 1.0
 
-        decoded = self.decoder(generated)
+        # --- INIZIO SIMULAZIONE JPEG ---
+        # L'output generato ha valori in [-1, 1]. DiffJPEG richiede [0, 1].
+        gen_shifted = (generated + 1.0) / 2.0
+        
+        # Inizializza il layer DiffJPEG (Quality = 90) dinamicamente in base alle dimensioni
+        if not hasattr(self, 'jpeg_sim') or self.jpeg_sim.height != cover.size(2) or self.jpeg_sim.width != cover.size(3):
+            N, C, H, W = cover.size()
+            self.jpeg_sim = DiffJPEG(height=H, width=W, differentiable=True, quality=90).to(self.device)
+        
+        # Applica il JPEG differenziabile
+        jpeg_encoded = self.jpeg_sim(gen_shifted)
+        
+        # Riporta in [-1, 1] per il decoder
+        jpeg_encoded = (jpeg_encoded * 2.0) - 1.0
+        
+        # Il decoder ora tenta di leggere i dati dall'immagine compressa in JPEG!
+        decoded = self.decoder(jpeg_encoded)
+        # --- FINE SIMULAZIONE JPEG ---
 
+        # Nota: ritorniamo 'generated' (non jpeg_encoded) come primo output per calcolare 
+        # la loss visiva (MSE) contro la cover originale senza che il JPEG sballi la metrica PSNR.
         return generated, payload, decoded
 
     def _critic(self, image):
@@ -135,8 +148,8 @@ class SteganoGAN(object):
 
     def _get_optimizers(self):
         _dec_list = list(self.decoder.parameters()) + list(self.encoder.parameters())
-        critic_optimizer = Adam(self.critic.parameters(), lr=1e-4)
-        decoder_optimizer = Adam(_dec_list, lr=1e-4)
+        critic_optimizer = Adam(self.critic.parameters(), lr=1e-5)
+        decoder_optimizer = Adam(_dec_list, lr=1e-5)
 
         return critic_optimizer, decoder_optimizer
 
