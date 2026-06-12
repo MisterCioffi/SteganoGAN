@@ -16,7 +16,6 @@ from steganogan.utils import bits_to_bytearray, bytearray_to_text, ssim, text_to
 
 from DiffJPEG import DiffJPEG
 
-
 DEFAULT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     'train')
@@ -112,6 +111,8 @@ class SteganoGAN(object):
 
     def _encode_decode(self, cover, quantize=False):
         """Encode random data and then decode it with JPEG compression."""
+        import torch.nn.functional as F
+        
         payload = self._random_data(cover)
         generated = self.encoder(cover, payload)
         
@@ -119,27 +120,39 @@ class SteganoGAN(object):
             generated = (255.0 * (generated + 1.0) / 2.0).long()
             generated = 2.0 * generated.float() / 255.0 - 1.0
 
-        # --- INIZIO SIMULAZIONE JPEG ---
-        # L'output generato ha valori in [-1, 1]. DiffJPEG richiede [0, 1].
+        # --- INIZIO SIMULAZIONE JPEG CON PADDING ---
         gen_shifted = (generated + 1.0) / 2.0
+        N, C, H, W = gen_shifted.size()
         
-        # Inizializza il layer DiffJPEG (Quality = 90) dinamicamente in base alle dimensioni
-        if not hasattr(self, 'jpeg_sim') or self.jpeg_sim.height != cover.size(2) or self.jpeg_sim.width != cover.size(3):
-            N, C, H, W = cover.size()
-            self.jpeg_sim = DiffJPEG(height=H, width=W, differentiable=True, quality=90).to(self.device)
+        # Calcola quanti pixel mancano per arrivare a un multiplo di 16
+        pad_H = (16 - (H % 16)) % 16
+        pad_W = (16 - (W % 16)) % 16
         
-        # Applica il JPEG differenziabile
+        # Aggiungi bordi temporanei se necessario
+        if pad_H > 0 or pad_W > 0:
+            gen_shifted = F.pad(gen_shifted, (0, pad_W, 0, pad_H), mode='replicate')
+            
+        # Inizializza DiffJPEG salvandoci le dimensioni manualmente per evitare l'errore
+        pad_N, pad_C, padded_H, padded_W = gen_shifted.size()
+        
+        if not hasattr(self, 'jpeg_sim') or getattr(self, '_current_jpeg_h', 0) != padded_H or getattr(self, '_current_jpeg_w', 0) != padded_W:
+            self.jpeg_sim = DiffJPEG(height=padded_H, width=padded_W, differentiable=True, quality=90).to(self.device)
+            self._current_jpeg_h = padded_H
+            self._current_jpeg_w = padded_W
+        
+        # Applica il JPEG
         jpeg_encoded = self.jpeg_sim(gen_shifted)
         
-        # Riporta in [-1, 1] per il decoder
+        # Rimuovi i bordi temporanei tornando all'esatta dimensione originale
+        if pad_H > 0 or pad_W > 0:
+            jpeg_encoded = jpeg_encoded[:, :, :H, :W]
+            
         jpeg_encoded = (jpeg_encoded * 2.0) - 1.0
         
-        # Il decoder ora tenta di leggere i dati dall'immagine compressa in JPEG!
+        # Il decoder legge l'immagine
         decoded = self.decoder(jpeg_encoded)
         # --- FINE SIMULAZIONE JPEG ---
 
-        # Nota: ritorniamo 'generated' (non jpeg_encoded) come primo output per calcolare 
-        # la loss visiva (MSE) contro la cover originale senza che il JPEG sballi la metrica PSNR.
         return generated, payload, decoded
 
     def _critic(self, image):
@@ -357,12 +370,6 @@ class SteganoGAN(object):
     def load(cls, architecture=None, path=None, cuda=True, verbose=False):
         """Loads an instance of SteganoGAN for the given architecture (default pretrained models)
         or loads a pretrained model from a given path.
-
-        Args:
-            architecture(str): Name of a pretrained model to be loaded from the default models.
-            path(str): Path to custom pretrained model. *Architecture must be None.
-            cuda(bool): Force loaded model to use cuda (if available).
-            verbose(bool): Force loaded model to use or not verbose.
         """
 
         if architecture and not path:
@@ -374,7 +381,28 @@ class SteganoGAN(object):
             raise ValueError(
                 'Please provide either an architecture or a path to pretrained model.')
 
-        steganogan = torch.load(path, map_location='cpu')
+        # --- INIZIO PATCH PER IGNORARE I VECCHI OTTIMIZZATORI ADAM ---
+        import torch.optim
+        original_setstate = torch.optim.Optimizer.__setstate__
+        
+        def safe_setstate(self, state):
+            if not hasattr(self, 'defaults'):
+                self.defaults = {}
+            try:
+                original_setstate(self, state)
+            except Exception:
+                pass
+                
+        torch.optim.Optimizer.__setstate__ = safe_setstate
+        # -----------------------------------------------------------
+
+        # Caricamento effettivo
+        steganogan = torch.load(path, map_location='cpu', weights_only=False)
+
+        # --- FINE PATCH (Ripristino comportamento originale) ---
+        torch.optim.Optimizer.__setstate__ = original_setstate
+        # -------------------------------------------------------
+
         steganogan.verbose = verbose
 
         steganogan.encoder.upgrade_legacy()
@@ -383,3 +411,4 @@ class SteganoGAN(object):
 
         steganogan.set_device(cuda)
         return steganogan
+
